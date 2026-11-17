@@ -1,2 +1,32 @@
 # esp_s3
 esp32_
+pin
+1. Дисплей ST7789 170×320
+Контакт дисплея	ESP32-S3
+VCC	3.3V
+GND	GND
+SCL	GPIO 12
+SDA	GPIO 11
+RES	GPIO 5
+DC	GPIO 7
+CS	GPIO 10
+BLK	GPIO 38
+
+2. SD-карта
+Контакт SD	ESP32-S3
+VCC	3.3V*
+GND	GND
+CS	GPIO 14
+SCK	GPIO 12
+MOSI	GPIO 11
+MISO	GPIO 13
+
+3. Шесть кнопок
+Каждая кнопка подключается между GPIO и GND.
+Кнопка	GPIO
+UP ↑	GPIO 1
+DOWN ↓	GPIO 2
+LEFT ←	GPIO 4
+RIGHT →	GPIO 6
+A	GPIO 8
+B	GPIO 9
