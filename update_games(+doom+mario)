@@ -1,0 +1,441 @@
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <math.h>
+
+// ===== PIN CONFIGURATION =====
+// Проверь GPIO перед загрузкой!
+#define TFT_CS    10
+#define TFT_DC     7
+#define TFT_RST    5
+#define TFT_MOSI  11
+#define TFT_SCK   12
+#define TFT_MISO  13
+#define SD_CS     14
+#define TFT_BL    38
+
+#define KEY_UP     1
+#define KEY_DOWN   2
+#define KEY_LEFT   4
+#define KEY_RIGHT  6
+#define KEY_A      8
+#define KEY_B      9
+
+#define SW 170
+#define SH 320
+
+SPIClass spi(FSPI);
+Adafruit_ST7789 tft(&spi, TFT_CS, TFT_DC, TFT_RST);
+
+const uint16_t BLACK = 0x0000;
+const uint16_t WHITE = 0xFFFF;
+const uint16_t SKY = 0x5D7F;
+const uint16_t FLOOR = 0x4208;
+const uint16_t RED = 0xF800;
+const uint16_t GREEN = 0x07E0;
+const uint16_t YELLOW = 0xFFE0;
+
+bool sdOK = false;
+int menu = 0;
+
+bool key(int pin) {
+  return digitalRead(pin) == LOW;
+}
+
+void center(const char *s, int y, uint16_t color, int size = 2) {
+  tft.setTextSize(size);
+  tft.setTextColor(color, BLACK);
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(s, 0, y, &x1, &y1, &w, &h);
+  tft.setCursor((SW - w) / 2, y);
+  tft.print(s);
+}
+
+void waitRelease() {
+  while (key(KEY_UP) || key(KEY_DOWN) ||
+         key(KEY_LEFT) || key(KEY_RIGHT) ||
+         key(KEY_A) || key(KEY_B)) {
+    delay(10);
+  }
+}
+
+// ===== MAIN MENU =====
+
+const char *items[] = {
+  "DOOM 3D",
+  "PLATFORMER",
+  "TXT READER",
+  "SD FILES"
+};
+
+void drawMenu() {
+  tft.fillScreen(BLACK);
+
+  center("MINI CONSOLE", 30, YELLOW);
+  center("ESP32-S3", 58, WHITE, 1);
+
+  for (int i = 0; i < 4; i++) {
+    int y = 105 + i * 40;
+
+    if (i == menu) {
+      tft.fillRoundRect(10, y - 5, 150, 30, 5, 0x39E7);
+    }
+
+    tft.setTextSize(2);
+    tft.setTextColor(i == menu ? YELLOW : WHITE);
+    tft.setCursor(20, y);
+    tft.print(items[i]);
+  }
+
+  tft.setTextSize(1);
+  tft.setTextColor(sdOK ? GREEN : RED);
+  tft.setCursor(5, 290);
+  tft.print(sdOK ? "SD CARD READY" : "SD CARD NOT FOUND");
+}
+
+// ===== DOOM-LIKE RAYCASTER =====
+
+const char world[9][13] = {
+  "111111111111",
+  "100000000001",
+  "101100000001",
+  "100000000001",
+  "100000110001",
+  "100000000001",
+  "101000000001",
+  "100000000001",
+  "111111111111"
+};
+
+float px = 2.5;
+float py = 2.5;
+float angle = 0;
+
+bool wall(int x, int y) {
+  if (x < 0 || y < 0 || x >= 12 || y >= 9) return true;
+  return world[y][x] == '1';
+}
+
+void drawDoom() {
+  tft.fillRect(0, 22, SW, SH / 2 - 22, SKY);
+  tft.fillRect(0, SH / 2, SW, SH / 2, FLOOR);
+
+  for (int sx = 0; sx < SW; sx++) {
+    float ray = angle - 0.52 + (float)sx / SW * 1.04;
+    float dist = 0.05;
+    bool hit = false;
+
+    while (dist < 12 && !hit) {
+      dist += 0.04;
+      int mx = (int)(px + cosf(ray) * dist);
+      int my = (int)(py + sinf(ray) * dist);
+      hit = wall(mx, my);
+    }
+
+    float corrected = dist * cosf(ray - angle);
+    corrected = max(corrected, 0.1f);
+
+    int h = constrain((int)(190 / corrected), 2, SH - 22);
+    int top = 22 + (SH - 22 - h) / 2;
+
+    uint16_t c = dist < 3 ? WHITE : 0x7BEF;
+    tft.drawFastVLine(sx, top, h, c);
+  }
+
+  tft.fillRect(0, 0, SW, 22, BLACK);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(5, 7);
+  tft.print("DOOM 3D");
+}
+
+void doomGame() {
+  px = 2.5;
+  py = 2.5;
+  angle = 0;
+
+  waitRelease();
+
+  while (!key(KEY_B)) {
+    if (key(KEY_LEFT)) angle -= 0.045;
+    if (key(KEY_RIGHT)) angle += 0.045;
+
+    float nx = px;
+    float ny = py;
+
+    if (key(KEY_UP)) {
+      nx += cosf(angle) * 0.07;
+      ny += sinf(angle) * 0.07;
+    }
+
+    if (key(KEY_DOWN)) {
+      nx -= cosf(angle) * 0.07;
+      ny -= sinf(angle) * 0.07;
+    }
+
+    if (!wall((int)nx, (int)py)) px = nx;
+    if (!wall((int)px, (int)ny)) py = ny;
+
+    drawDoom();
+
+    if (key(KEY_A)) {
+      tft.fillRect(65, 145, 40, 25, WHITE);
+      delay(100);
+    }
+
+    delay(25);
+  }
+
+  waitRelease();
+}
+
+// ===== PLATFORMER =====
+
+#define TILE 16
+const char *platformMap[10] = {
+  "................................",
+  "................................",
+  "...........C....................",
+  "......###...........C............",
+  "................#####............",
+  "..C..............................",
+  ".....####..............###.......",
+  ".............#####................",
+  "..................................",
+  "################################"
+};
+
+int playerX = 24;
+int playerY = 100;
+float velocityY = 0;
+int coins = 0;
+int cameraX = 0;
+bool grounded = false;
+
+bool solid(int x, int y) {
+  int tx = x / TILE;
+  int ty = y / TILE;
+
+  if (tx < 0 || tx >= 32 || ty < 0) return true;
+  if (ty >= 10) return false;
+
+  return platformMap[ty][tx] == '#';
+}
+
+void drawPlatform() {
+  tft.fillScreen(SKY);
+
+  for (int y = 0; y < 10; y++) {
+    for (int x = 0; x < 32; x++) {
+      int sx = x * TILE - cameraX;
+      int sy = y * TILE + 75;
+
+      if (sx < -TILE || sx > SW || sy < -TILE || sy > SH) continue;
+
+      if (platformMap[y][x] == '#') {
+        tft.fillRect(sx, sy, TILE, TILE, 0xA145);
+      }
+
+      if (platformMap[y][x] == 'C') {
+        tft.fillCircle(sx + 8, sy + 8, 5, YELLOW);
+      }
+    }
+  }
+
+  tft.fillRect(playerX - cameraX, playerY + 75, 12, 15, RED);
+
+  tft.fillRect(0, 0, SW, 22, BLACK);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(5, 7);
+  tft.printf("COINS: %d  B: MENU", coins);
+}
+
+void platformGame() {
+  playerX = 24;
+  playerY = 100;
+  velocityY = 0;
+  coins = 0;
+  cameraX = 0;
+  grounded = false;
+
+  waitRelease();
+
+  while (!key(KEY_B)) {
+    if (key(KEY_LEFT)) playerX -= 2;
+    if (key(KEY_RIGHT)) playerX += 2;
+
+    if (key(KEY_A) && grounded) {
+      velocityY = -7.5;
+      grounded = false;
+    }
+
+    velocityY += 0.32;
+    if (velocityY > 6) velocityY = 6;
+
+    int newY = playerY + (int)velocityY;
+
+    if (velocityY >= 0 &&
+        (solid(playerX + 2, newY + 15) ||
+         solid(playerX + 10, newY + 15))) {
+      playerY = (newY / TILE) * TILE - 15;
+      velocityY = 0;
+      grounded = true;
+    } else {
+      playerY = newY;
+      grounded = false;
+    }
+
+    if (playerX < 0) playerX = 0;
+    if (playerY > 300) {
+      playerX = 24;
+      playerY = 100;
+      velocityY = 0;
+    }
+
+    cameraX = max(0, playerX - SW / 2);
+    drawPlatform();
+    delay(30);
+  }
+
+  waitRelease();
+}
+
+// ===== SD TEXT FILE READER =====
+
+void textReader() {
+  if (!sdOK) return;
+
+  File f = SD.open("/BOOKS/BOOK.TXT", FILE_READ);
+
+  if (!f) {
+    tft.fillScreen(BLACK);
+    center("BOOK.TXT NOT FOUND", 100, YELLOW, 1);
+    center("B = BACK", 270, WHITE, 1);
+    while (!key(KEY_B)) delay(20);
+    waitRelease();
+    return;
+  }
+
+  while (true) {
+    tft.fillScreen(BLACK);
+    int y = 10;
+
+    for (int i = 0; i < 18 && f.available(); i++) {
+      String line = f.readStringUntil('\n');
+      line.trim();
+
+      tft.setTextSize(1);
+      tft.setTextColor(WHITE);
+      tft.setCursor(3, y);
+      tft.println(line.substring(0, 27));
+      y += 16;
+    }
+
+    center("A: NEXT  B: EXIT", 295, YELLOW, 1);
+
+    while (!key(KEY_A) && !key(KEY_B)) delay(10);
+
+    if (key(KEY_B)) break;
+    waitRelease();
+
+    if (!f.available()) break;
+  }
+
+  f.close();
+  waitRelease();
+}
+
+// ===== SD FILE LIST =====
+
+void sdFiles() {
+  tft.fillScreen(BLACK);
+
+  if (!sdOK) {
+    center("SD NOT FOUND", 100, RED);
+  } else {
+    File root = SD.open("/");
+    int y = 20;
+
+    while (true) {
+      File f = root.openNextFile();
+      if (!f) break;
+
+      tft.setTextSize(1);
+      tft.setTextColor(WHITE);
+      tft.setCursor(3, y);
+      tft.println(f.name());
+
+      y += 15;
+      f.close();
+
+      if (y > 270) break;
+    }
+
+    root.close();
+  }
+
+  center("B = BACK", 295, YELLOW, 1);
+
+  while (!key(KEY_B)) delay(20);
+  waitRelease();
+}
+
+// ===== SETUP =====
+
+void setup() {
+  pinMode(KEY_UP, INPUT_PULLUP);
+  pinMode(KEY_DOWN, INPUT_PULLUP);
+  pinMode(KEY_LEFT, INPUT_PULLUP);
+  pinMode(KEY_RIGHT, INPUT_PULLUP);
+  pinMode(KEY_A, INPUT_PULLUP);
+  pinMode(KEY_B, INPUT_PULLUP);
+
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+
+  spi.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
+
+  tft.init(170, 320);
+  tft.setRotation(0);
+
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+
+  sdOK = SD.begin(SD_CS, spi, 4000000);
+
+  drawMenu();
+}
+
+// ===== MAIN LOOP =====
+
+void loop() {
+  if (key(KEY_UP)) {
+    menu = (menu + 3) % 4;
+    drawMenu();
+    waitRelease();
+  }
+
+  if (key(KEY_DOWN)) {
+    menu = (menu + 1) % 4;
+    drawMenu();
+    waitRelease();
+  }
+
+  if (key(KEY_A)) {
+    waitRelease();
+
+    if (menu == 0) doomGame();
+    if (menu == 1) platformGame();
+    if (menu == 2) textReader();
+    if (menu == 3) sdFiles();
+
+    drawMenu();
+  }
+
+  delay(20);
+}
