@@ -1,0 +1,550 @@
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <math.h>
+
+// GITES199 MINI CONSOLE
+// ESP32-S3 DevKitC-1 N8R2
+// ST7789 170x320 + SPI microSD + 6 buttons
+
+// ---------- DISPLAY ----------
+#define TFT_CS   10
+#define TFT_DC   7
+#define TFT_RST  5
+#define TFT_BL   38
+#define SCREEN_W 320
+#define SCREEN_H 170
+
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+// ---------- SD CARD ----------
+#define SD_CS    14
+#define SD_SCK   12
+#define SD_MISO  13
+#define SD_MOSI  11
+bool sdReady = false;
+
+// ---------- BUTTONS (GPIO to GND) ----------
+#define BTN_UP     1
+#define BTN_DOWN   2
+#define BTN_LEFT   4
+#define BTN_RIGHT  6
+#define BTN_A      8
+#define BTN_B      9
+
+// ---------- RGB565 COLORS ----------
+#define BLACK   0x0000
+#define WHITE   0xFFFF
+#define RED     0xF800
+#define GREEN   0x07E0
+#define BLUE    0x001F
+#define YELLOW  0xFFE0
+#define ORANGE  0xFD20
+#define GRAY    0x8410
+#define DARK    0x2104
+#define PINK    0xF9B2
+#define CYAN    0x07FF
+
+int brightness = 80;
+int fps = 30;
+int frameDelay() { return 1000 / max(1, fps); }
+
+void setBrightness() {
+  analogWrite(TFT_BL, map(brightness, 0, 100, 0, 255));
+}
+
+// ---------- IMPROVED BUTTON DEBOUNCER ----------
+bool key(int pin) { return digitalRead(pin) == LOW; }
+
+bool newPress(int pin) {
+  static bool lastState[49] = {false};
+  static unsigned long lastDebounce[49] = {0};
+  
+  bool currentState = key(pin);
+  bool pressed = false;
+
+  if (currentState != lastState[pin]) {
+    lastDebounce[pin] = millis();
+  }
+
+  if ((millis() - lastDebounce[pin]) > 20) {
+    static bool confirmedState[49] = {false};
+    if (currentState != confirmedState[49]) {
+      confirmedState[49] = currentState;
+      if (confirmedState[49] == true) {
+        pressed = true;
+      }
+    }
+  }
+  lastState[pin] = currentState;
+  return pressed;
+}
+
+void waitRelease(int pin) {
+  while (key(pin)) delay(5);
+  delay(15);
+}
+
+// ---------- BOOT LOGO ----------
+void heart(int x, int y) {
+  tft.fillRect(x + 4, y, 5, 5, RED);
+  tft.fillRect(x + 12, y, 5, 5, RED);
+  tft.fillRect(x, y + 5, 21, 8, RED);
+  tft.fillRect(x + 4, y + 13, 13, 5, RED);
+  tft.fillRect(x + 8, y + 18, 5, 5, RED);
+}
+
+void drawPig(bool looking, bool smiling) {
+  tft.fillScreen(BLACK);
+  tft.fillRect(25, 25, 22, 25, ORANGE);
+  tft.fillRect(95, 25, 22, 25, ORANGE);
+  tft.fillRect(31, 31, 12, 14, DARK);
+  tft.fillRect(101, 31, 12, 14, DARK);
+
+  tft.fillRoundRect(18, 42, 108, 92, ORANGE, 22);
+  tft.fillRoundRect(27, 50, 90, 76, PINK, 18);
+  tft.fillRect(18, 62, 12, 55, DARK);
+  tft.fillRect(114, 64, 12, 48, DARK);
+
+  int offset = looking ? 5 : 0;
+  tft.fillRect(42 + offset, 72, 13, 17, BLACK);
+  tft.fillRect(88 + offset, 72, 13, 17, BLACK);
+  tft.fillRect(46 + offset, 75, 5, 5, WHITE);
+  tft.fillRect(92 + offset, 75, 5, 5, WHITE);
+  tft.fillRect(63, 99, 18, 8, RED);
+
+  if (smiling) {
+    tft.fillRect(56, 113, 32, 4, DARK);
+    tft.fillRect(64, 117, 16, 5, RED);
+    heart(10, 12);
+  } else {
+    tft.fillRect(65, 113, 14, 3, DARK);
+  }
+
+  tft.fillRoundRect(48, 126, 62, 24, BLACK, 6);
+  tft.fillRect(58, 135, 14, 4, WHITE);
+  tft.fillRect(63, 130, 4, 14, WHITE);
+  tft.fillRect(87, 134, 5, 5, RED);
+  tft.fillRect(97, 140, 5, 5, BLUE);
+
+  tft.setTextColor(YELLOW);
+  tft.setTextSize(2);
+  tft.setCursor(150, 48);
+  tft.print("GITES199");
+  tft.setTextColor(WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(152, 78);
+  tft.print("MINI CONSOLE");
+  tft.setCursor(152, 98);
+  tft.print(smiling ? "READY!" : "STARTING...");
+}
+
+void bootLogo() {
+  drawPig(true, false);
+  delay(1000);
+  drawPig(false, true);
+  delay(600);
+}
+
+// ---------- FORWARD DECLARATIONS ----------
+void mainMenu();
+void settingsMenu();
+void doomGame();
+void snakeGame();
+void pongGame();
+void shooterGame();
+void readText();
+void showFiles();
+
+// ---------- MAIN MENU ----------
+const char* menuItems[] = {
+  "DOOM 3D", "SNAKE", "PONG", "SPACE SHOOTER", "READ TXT", "SD FILES", "SETTINGS"
+};
+const int MENU_COUNT = 7;
+int menuIndex = 0;
+
+void drawMenu() {
+  tft.fillScreen(BLACK);
+  tft.setTextColor(YELLOW);
+  tft.setTextSize(2);
+  tft.setCursor(8, 5);
+  tft.print("GITES199");
+  tft.drawFastHLine(8, 25, 304, BLUE);
+
+  for (int i = 0; i < MENU_COUNT; i++) {
+    int y = 30 + (i * 17);
+    if (i == menuIndex) {
+      tft.fillRoundRect(8, y - 1, 304, 16, 3, BLUE);
+      tft.setTextColor(WHITE);
+    } else {
+      tft.setTextColor(GRAY);
+    }
+    tft.setTextSize(1);
+    tft.setCursor(15, y + 3);
+    tft.print(i + 1);
+    tft.print(". ");
+    tft.print(menuItems[i]);
+  }
+
+  tft.setTextColor(GREEN);
+  tft.setCursor(8, 155);
+  tft.print("A: SELECT");
+  tft.setCursor(205, 155);
+  tft.setTextColor(sdReady ? GREEN : RED);
+  tft.print(sdReady ? "SD: READY" : "SD: NO SD");
+}
+
+void mainMenu() {
+  drawMenu();
+  while (true) {
+    if (newPress(BTN_UP)) {
+      menuIndex = (menuIndex + MENU_COUNT - 1) % MENU_COUNT;
+      drawMenu();
+    }
+    if (newPress(BTN_DOWN)) {
+      menuIndex = (menuIndex + 1) % MENU_COUNT;
+      drawMenu();
+    }
+    if (newPress(BTN_A)) {
+      waitRelease(BTN_A);
+      switch (menuIndex) {
+        case 0: doomGame(); break;
+        case 1: snakeGame(); break;
+        case 2: pongGame(); break;
+        case 3: shooterGame(); break;
+        case 4: readText(); break;
+        case 5: showFiles(); break;
+        case 6: settingsMenu(); break;
+      }
+      drawMenu();
+    }
+    delay(5);
+  }
+}
+
+// ---------- SETTINGS ----------
+void settingsMenu() {
+  int selected = 0;
+  while (true) {
+    tft.fillScreen(BLACK);
+    tft.setTextColor(YELLOW);
+    tft.setTextSize(2);
+    tft.setCursor(8, 8);
+    tft.print("SETTINGS");
+
+    tft.setTextSize(1);
+    tft.setCursor(18, 55);
+    tft.setTextColor(selected == 0 ? GREEN : WHITE);
+    tft.print("Brightness: ");
+    tft.print(brightness);
+    tft.print("%");
+
+    tft.setCursor(18, 80);
+    tft.setTextColor(selected == 1 ? GREEN : WHITE);
+    tft.print("FPS: ");
+    tft.print(fps);
+
+    tft.setTextColor(GRAY);
+    tft.setCursor(18, 120); tft.print("UP/DOWN: SELECT");
+    tft.setCursor(165, 120); tft.print("LEFT/RIGHT: CHANGE");
+    tft.setCursor(18, 150); tft.print("B: BACK");
+
+    if (newPress(BTN_UP) || newPress(BTN_DOWN)) selected = 1 - selected;
+
+    bool leftPressed = newPress(BTN_LEFT);
+    bool rightPressed = newPress(BTN_RIGHT);
+    if (leftPressed || rightPressed) {
+      int dir = rightPressed ? 1 : -1;
+      if (selected == 0) {
+        brightness = constrain(brightness + dir * 10, 10, 100);
+        setBrightness();
+      } else {
+        const int opts[] = {15, 30, 45, 60};
+        int pos = 1;
+        for (int i = 0; i < 4; i++) if (fps == opts[i]) pos = i;
+        pos = constrain(pos + dir, 0, 3);
+        fps = opts[pos];
+      }
+    }
+
+    if (newPress(BTN_B)) {
+      waitRelease(BTN_B);
+      return;
+    }
+    delay(10);
+  }
+}
+
+// ---------- 1. REAL DOOM 3D RAYCASTER ----------
+const char worldMap[8][9] = {
+  "########",
+  "#......#",
+  "#.###..#",
+  "#.#....#",
+  "#.#.##.#",
+  "#......#",
+  "#..##..#",
+  "########"
+};
+
+void doomGame() {
+  float pX = 3.5f, pY = 3.5f;
+  float pA = 0.0f;
+
+  while (true) {
+    if (newPress(BTN_B)) {
+      waitRelease(BTN_B);
+      return;
+    }
+
+    if (key(BTN_LEFT))  pA -= 0.06f;
+    if (key(BTN_RIGHT)) pA += 0.06f;
+    
+    float moveStep = 0.08f;
+    if (key(BTN_UP)) {
+      float nx = pX + cosf(pA) * moveStep;
+      float ny = pY + sinf(pA) * moveStep;
+      if (worldMap[(int)ny][(int)nx] == '.') { pX = nx; pY = ny; }
+    }
+    if (key(BTN_DOWN)) {
+      float nx = pX - cosf(pA) * moveStep;
+      float ny = pY - sinf(pA) * moveStep;
+      if (worldMap[(int)ny][(int)nx] == '.') { pX = nx; pY = ny; }
+    }
+
+    tft.fillRect(0, 0, SCREEN_W, 85, 0x1831); // Потолок
+    tft.fillRect(0, 85, SCREEN_W, 85, 0x3186); // Пол
+
+    for (int x = 0; x < SCREEN_W; x++) {
+      float rayAngle = (pA - 0.52359f) + ((float)x / SCREEN_W) * 1.04719f;
+      float distanceToWall = 0.0f;
+      bool hitWall = false;
+
+      float cosA = cosf(rayAngle);
+      float sinA = sinf(rayAngle);
+
+      while (!hitWall && distanceToWall < 16.0f) {
+        distanceToWall += 0.05f;
+        int testX = (int)(pX + cosA * distanceToWall);
+        int testY = (int)(pY + sinA * distanceToWall);
+
+        if (testX < 0 || testX >= 8 || testY < 0 || testY >= 8) {
+          hitWall = true;
+          distanceToWall = 16.0f;
+        } else if (worldMap[testY][testX] == '#') {
+          hitWall = true;
+        }
+      }
+
+      int ceiling = SCREEN_H / 2 - SCREEN_H / ((distanceToWall == 0 ? 0.001 : distanceToWall));
+      int floor = SCREEN_H - ceiling;
+      
+      uint16_t wallColor = (distanceToWall < 4.0f) ? RED : ((distanceToWall < 8.0f) ? ORANGE : GRAY);
+      tft.drawFastVLine(x, max(0, ceiling), min(SCREEN_H, floor - ceiling), wallColor);
+    }
+
+    tft.setTextColor(WHITE);
+    tft.setTextSize(1);
+    tft.setCursor(5, 5);
+    tft.print("DOOM 3D - B: EXIT");
+    delay(15);
+  }
+}
+
+// ---------- 2. SNAKE GAME ----------
+void snakeGame() {
+  int sx[100], sy[100];
+  int len = 3;
+  for (int i = 0; i < len; i++) { sx[i] = 20 - i * 2; sy[i] = 10; }
+  int dx = 2, dy = 0;
+  int fx = 15, fy = 10;
+  int score = 0;
+
+  while (true) {
+    if (newPress(BTN_B)) { waitRelease(BTN_B); return; }
+    if (key(BTN_UP) && dy == 0)    { dx = 0; dy = -2; }
+    if (key(BTN_DOWN) && dy == 0)  { dx = 0; dy = 2; }
+    if (key(BTN_LEFT) && dx == 0)  { dx = -2; dy = 0; }
+    if (key(BTN_RIGHT) && dx == 0) { dx = 2; dy = 0; }
+
+    for (int i = len - 1; i > 0; i--) {
+      sx[i] = sx[i - 1];
+      sy[i] = sy[i - 1];
+    }
+    sx[0] += dx;
+    sy[0] += dy;
+
+    // Столкновение со стенами
+    if (sx[0] < 0 || sx[0] >= 160 || sy[0] < 10 || sy[0] >= 85) {
+      tft.fillScreen(RED);
+      tft.setTextColor(WHITE); tft.setTextSize(2); tft.setCursor(100, 70);
+      tft.print("GAME OVER");
+      delay(1500);
+      return;
+    }
+
+    // Поедание еды
+    if (abs(sx[0] - fx) < 2 && abs(sy[0] - fy) < 2) {
+      score++;
+      len = min(len + 1, 90);
+      fx = (rand() % 75) * 2;
+      fy = 10 + (rand() % 35) * 2;
+    }
+
+    tft.fillScreen(BLACK);
+    tft.fillRect(fx * 2, fy * 2, 4, 4, GREEN);
+    for (int i = 0; i < len; i++) {
+      tft.fillRect(sx[i] * 2, sy[i] * 2, 4, 4, YELLOW);
+    }
+    tft.setTextColor(WHITE); tft.setTextSize(1);
+    tft.setCursor(5, 2); tft.print("SNAKE SCORE: "); tft.print(score);
+    delay(100);
+  }
+}
+
+// ---------- 3. PONG GAME ----------
+void pongGame() {
+  int ballX = 160, ballY = 85, bX = 2, bY = 2;
+  int p1Y = 70, p2Y = 70;
+  int score1 = 0, score2 = 0;
+
+  while (true) {
+    if (newPress(BTN_B)) { waitRelease(BTN_B); return; }
+    if (key(BTN_UP))   p1Y = max(15, p1Y - 3);
+    if (key(BTN_DOWN)) p1Y = min(130, p1Y + 3);
+
+    // AI для второго игрока
+    if (p2Y + 15 < ballY) p2Y += 2;
+    if (p2Y + 15 > ballY) p2Y -= 2;
+
+    ballX += bX;
+    ballY += bY;
+
+    if (ballY <= 15 || ballY >= 165) bY = -bY;
+    
+    // Ракетка игрока
+    if (ballX <= 15 && ballY >= p1Y && ballY <= p1Y + 30) {
+      bX = -bX; ballX = 15;
+    }
+    // Ракетка бота
+    if (ballX >= 305 && ballY >= p2Y && ballY <= p2Y + 30) {
+      bX = -bX; ballX = 305;
+    }
+
+    if (ballX < 0) { score2++; ballX = 160; ballY = 85; }
+    if (ballX > 320) { score1++; ballX = 160; ballY = 85; }
+
+    tft.fillScreen(BLACK);
+    tft.drawFastHLine(0, 12, 320, BLUE);
+    tft.fillRect(10, p1Y, 5, 30, WHITE);
+    tft.fillRect(305, p2Y, 5, 30, WHITE);
+    tft.fillCircle(ballX, ballY, 3, YELLOW);
+
+    tft.setTextColor(WHITE); tft.setTextSize(1);
+    tft.setCursor(140, 2); tft.print(score1); tft.print(" : "); tft.print(score2);
+    delay(20);
+  }
+}
+
+// ---------- 4. SPACE SHOOTER ----------
+void shooterGame() {
+  int shipX = 150;
+  int bulletX = -10, bulletY = -10;
+  int enemyX = rand() % 280, enemyY = 20;
+  int score = 0;
+
+  while (true) {
+    if (newPress(BTN_B)) { waitRelease(BTN_B); return; }
+    if (key(BTN_LEFT))  shipX = max(5, shipX - 4);
+    if (key(BTN_RIGHT)) shipX = min(300, shipX + 4);
+    if (newPress(BTN_A) && bulletY < 0) {
+      bulletX = shipX + 6;
+      bulletY = 130;
+    }
+
+    if (bulletY > 0) bulletY -= 8;
+    enemyY += 1;
+
+    // Попадание в врага
+    if (abs(bulletX - enemyX) < 12 && abs(bulletY - enemyY) < 10) {
+      score++;
+      enemyX = rand() % 280;
+      enemyY = 20;
+      bulletY = -10;
+    }
+
+    if (enemyY > 150) {
+      tft.fillScreen(RED);
+      tft.setTextColor(WHITE); tft.setTextSize(2); tft.setCursor(110, 70);
+      tft.print("GAME OVER");
+      delay(1500);
+      return;
+    }
+
+    tft.fillScreen(BLACK);
+    // Корабль
+    tft.fillRect(shipX, 140, 14, 10, GREEN);
+    tft.fillRect(shipX + 5, 135, 4, 6, WHITE);
+    // Пуля
+    if (bulletY > 0) tft.fillRect(bulletX, bulletY, 2, 6, YELLOW);
+    // Враг
+    tft.fillRect(enemyX, enemyY, 12, 10, RED);
+
+    tft.setTextColor(CYAN); tft.setTextSize(1);
+    tft.setCursor(5, 5); tft.print("SCORE: "); tft.print(score);
+    delay(25);
+  }
+}
+
+// ---------- SD FILE BROWSER ----------
+void showFiles() {
+  if (!sdReady) {
+    tft.fillScreen(BLACK); tft.setTextColor(RED);
+    tft.setCursor(10, 100); tft.print("SD NOT FOUND");
+    delay(1200); return;
+  }
+  File root = SD.open("/");
+  if (!root) return;
+
+  tft.fillScreen(BLACK);
+  tft.setTextColor(YELLOW);
+  tft.setCursor(5, 5); tft.print("SD FILES");
+
+  int line = 0;
+  File entry;
+  while ((entry = root.openNextFile())) {
+    if (line < 7) {
+      tft.setTextColor(entry.isDirectory() ? GREEN : WHITE);
+      tft.setCursor(5, 25 + line * 17);
+      tft.print(entry.name());
+    }
+    line++;
+    entry.close();
+  }
+  root.close();
+  tft.setTextColor(GREEN);
+  tft.setCursor(270, 155); tft.print("B: BACK");
+  while (!newPress(BTN_B)) delay(10);
+  waitRelease(BTN_B);
+}
+
+// ---------- TXT READER ----------
+void readText() {
+  if (!sdReady) {
+    tft.fillScreen(BLACK); tft.setTextColor(RED);
+    tft.setCursor(10, 100); tft.print("SD NOT FOUND");
+    delay(1200); return;
+  }
+  File file = SD.open("/BOOKS/BOOK.TXT", FILE_READ);
+  if (!file) {
+    tft.fillScreen(BLACK); tft.setTextColor(RED);
+    tft.setCursor(10, 100); tft.print("BOOK NOT FOUND");
+    delay(1200); return;
+  }
+
+  const int linesPerPage = 7;
+  String lines[linesPerPage];
+
+  while (true) {
+    bool hasContent =
