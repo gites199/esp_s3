@@ -1,0 +1,572 @@
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <math.h>
+
+// GITES199 MINI CONSOLE
+// ESP32-S3 DevKitC-1 N8R2
+// ST7789 170x320 + SPI microSD + 6 buttons
+
+// ---------- DISPLAY ----------
+#define TFT_CS   10
+#define TFT_DC   7
+#define TFT_RST  5
+#define TFT_BL   38
+#define SCREEN_W 320
+#define SCREEN_H 170
+
+// Инициализация с правильным размером матрицы
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+// ---------- SD CARD: shared SPI bus ----------
+#define SD_CS    14
+#define SD_SCK   12
+#define SD_MISO  13
+#define SD_MOSI  11
+bool sdReady = false;
+
+// ---------- BUTTONS (button connects GPIO to GND) ----------
+#define BTN_UP     1
+#define BTN_DOWN   2
+#define BTN_LEFT   4
+#define BTN_RIGHT  6
+#define BTN_A      8
+#define BTN_B      9
+
+// ---------- RGB565 COLORS ----------
+#define BLACK   0x0000
+#define WHITE   0xFFFF
+#define RED     0xF800
+#define GREEN   0x07E0
+#define BLUE    0x001F
+#define YELLOW  0xFFE0
+#define ORANGE  0xFD20
+#define GRAY    0x8410
+#define DARK    0x2104
+#define PINK    0xF9B2
+
+int brightness = 80;
+int fps = 30;
+int frameDelay() { return 1000 / max(1, fps); }
+
+void setBrightness() {
+  analogWrite(TFT_BL, map(brightness, 0, 100, 0, 255));
+}
+
+// ---------- BUTTON HELPERS ----------
+bool key(int pin) { return digitalRead(pin) == LOW; }
+
+bool newPress(int pin) {
+  static bool previous[49] = {false};
+  static unsigned long changedAt[49] = {0};
+  static bool stable[49] = {false};
+
+  bool raw = key(pin);
+  if (raw != previous[pin]) {
+    previous[pin] = raw;
+    changedAt[pin] = millis();
+  }
+  if (millis() - changedAt[pin] >= 25 && stable[pin] != raw) {
+    stable[pin] = raw;
+    if (stable[pin]) return true;
+  }
+  return false;
+}
+
+void waitRelease(int pin) {
+  while (key(pin)) delay(5);
+  delay(25);
+}
+
+// ---------- PIXEL GUINEA-PIG START LOGO ----------
+void heart(int x, int y) {
+  tft.fillRect(x + 4, y, 5, 5, RED);
+  tft.fillRect(x + 12, y, 5, 5, RED);
+  tft.fillRect(x, y + 5, 21, 8, RED);
+  tft.fillRect(x + 4, y + 13, 13, 5, RED);
+  tft.fillRect(x + 8, y + 18, 5, 5, RED);
+}
+
+void drawPig(bool looking, bool smiling) {
+  tft.fillScreen(BLACK);
+
+  tft.fillRect(25, 25, 22, 25, ORANGE);
+  tft.fillRect(95, 25, 22, 25, ORANGE);
+  tft.fillRect(31, 31, 12, 14, DARK);
+  tft.fillRect(101, 31, 12, 14, DARK);
+
+  tft.fillRoundRect(18, 42, 108, 92, ORANGE, 22);
+  tft.fillRoundRect(27, 50, 90, 76, PINK, 18);
+  tft.fillRect(18, 62, 12, 55, DARK);
+  tft.fillRect(114, 64, 12, 48, DARK);
+
+  int offset = looking ? 5 : 0;
+  tft.fillRect(42 + offset, 72, 13, 17, BLACK);
+  tft.fillRect(88 + offset, 72, 13, 17, BLACK);
+  tft.fillRect(46 + offset, 75, 5, 5, WHITE);
+  tft.fillRect(92 + offset, 75, 5, 5, WHITE);
+  tft.fillRect(63, 99, 18, 8, RED);
+
+  if (smiling) {
+    tft.fillRect(56, 113, 32, 4, DARK);
+    tft.fillRect(64, 117, 16, 5, RED);
+    heart(10, 12);
+  } else {
+    tft.fillRect(65, 113, 14, 3, DARK);
+  }
+
+  tft.fillRoundRect(48, 126, 62, 24, BLACK, 6);
+  tft.fillRect(58, 135, 14, 4, WHITE);
+  tft.fillRect(63, 130, 4, 14, WHITE);
+  tft.fillRect(87, 134, 5, 5, RED);
+  tft.fillRect(97, 140, 5, 5, BLUE);
+
+  tft.setTextColor(YELLOW);
+  tft.setTextSize(2);
+  tft.setCursor(150, 48);
+  tft.print("GITES199");
+  tft.setTextColor(WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(152, 78);
+  tft.print("MINI CONSOLE");
+  tft.setCursor(152, 98);
+  tft.print(smiling ? "READY!" : "STARTING...");
+}
+
+void bootLogo() {
+  drawPig(true, false);
+  delay(1200);
+  drawPig(false, true);
+  delay(700);
+  tft.setTextColor(BLUE);
+  tft.setTextSize(2);
+  tft.setCursor(30, 130);
+  tft.print("STARTING");
+  delay(700);
+}
+
+// ---------- FORWARD DECLARATIONS ----------
+void mainMenu();
+void settingsMenu();
+void doomGame();
+void platformGame();
+void readText();
+void showFiles();
+
+// ---------- MAIN MENU ----------
+const char* menuItems[] = {
+  "DOOM 3D", "PLATFORMER", "READ TXT", "SD FILES", "SETTINGS"
+};
+const int MENU_COUNT = 5;
+int menuIndex = 0;
+
+void drawMenu() {
+  tft.fillScreen(BLACK);
+  tft.setTextColor(YELLOW);
+  tft.setTextSize(2);
+  tft.setCursor(8, 5);
+  tft.print("GITES199");
+  tft.drawFastHLine(8, 25, 304, BLUE);
+
+  for (int i = 0; i < MENU_COUNT; i++) {
+    int y = 34 + i * 23;
+    if (i == menuIndex) {
+      tft.fillRoundRect(8, y - 2, 304, 21, 4, BLUE);
+      tft.setTextColor(WHITE);
+    } else {
+      tft.setTextColor(GRAY);
+    }
+    tft.setTextSize(1);
+    tft.setCursor(18, y + 4);
+    tft.print(i + 1);
+    tft.print(". ");
+    tft.print(menuItems[i]);
+  }
+
+  tft.setTextColor(GREEN);
+  tft.setCursor(8, 155);
+  tft.print("A: SELECT   B: BACK");
+  tft.setCursor(205, 155);
+  tft.setTextColor(sdReady ? GREEN : RED);
+  tft.print(sdReady ? "SD: READY" : "SD: NO SD");
+}
+
+void mainMenu() {
+  drawMenu();
+  while (true) {
+    if (newPress(BTN_UP)) {
+      menuIndex = (menuIndex + MENU_COUNT - 1) % MENU_COUNT;
+      drawMenu();
+    }
+    if (newPress(BTN_DOWN)) {
+      menuIndex = (menuIndex + 1) % MENU_COUNT;
+      drawMenu();
+    }
+    if (newPress(BTN_A)) {
+      waitRelease(BTN_A);
+      switch (menuIndex) {
+        case 0: doomGame(); break;
+        case 1: platformGame(); break;
+        case 2: readText(); break;
+        case 3: showFiles(); break;
+        case 4: settingsMenu(); break;
+      }
+      drawMenu();
+    }
+    delay(5);
+  }
+}
+
+// ---------- SETTINGS ----------
+void settingsMenu() {
+  int selected = 0;
+  while (true) {
+    tft.fillScreen(BLACK);
+    tft.setTextColor(YELLOW);
+    tft.setTextSize(2);
+    tft.setCursor(8, 8);
+    tft.print("SETTINGS");
+
+    tft.setTextSize(1);
+    tft.setCursor(18, 55);
+    tft.setTextColor(selected == 0 ? GREEN : WHITE);
+    tft.print("Brightness: ");
+    tft.print(brightness);
+    tft.print("%");
+
+    tft.setCursor(18, 80);
+    tft.setTextColor(selected == 1 ? GREEN : WHITE);
+    tft.print("FPS: ");
+    tft.print(fps);
+
+    tft.setTextColor(GRAY);
+    tft.setCursor(18, 120); tft.print("UP/DOWN: SELECT");
+    tft.setCursor(165, 120); tft.print("LEFT/RIGHT: CHANGE");
+    tft.setCursor(18, 150); tft.print("B: BACK");
+
+    if (newPress(BTN_UP) || newPress(BTN_DOWN)) selected = 1 - selected;
+
+    bool leftPressed = newPress(BTN_LEFT);
+    bool rightPressed = newPress(BTN_RIGHT);
+    if (leftPressed || rightPressed) {
+      int direction = rightPressed ? 1 : -1;
+      if (selected == 0) {
+        brightness = constrain(brightness + direction * 10, 10, 100);
+        setBrightness();
+      } else {
+        const int options[] = {15, 30, 45, 60};
+        int pos = 1;
+        for (int i = 0; i < 4; i++) if (fps == options[i]) pos = i;
+        pos = constrain(pos + direction, 0, 3);
+        fps = options[pos];
+      }
+    }
+
+    if (newPress(BTN_B)) {
+      waitRelease(BTN_B);
+      return;
+    }
+    delay(10);
+  }
+}
+
+// ---------- SIMPLE DOOM-LIKE RAYCASTER ----------
+const char worldMap[9][13] = {
+  "############",
+  "#..........#",
+  "#..##......#",
+  "#..........#",
+  "#......##..#",
+  "#..........#",
+  "#..#.......#",
+  "#..........#",
+  "############"
+};
+
+float playerX = 2.5f;
+float playerY = 2.5f;
+float playerAngle = 0.0f;
+
+bool wallAt(float x, float y) {
+  int mx = (int)x;
+  int my = (int)y;
+  if (mx < 0 || mx >= 12 || my < 0 || my >= 9) return true;
+  return worldMap[my][mx] == '#';
+}
+
+void renderDoom() {
+  tft.fillRect(0, 0, SCREEN_W, 85, 0x39E7);
+  tft.fillRect(0, 85, SCREEN_W, 85, 0x630C);
+
+  for (int x = 0; x < SCREEN_W; x++) {
+    float rayAngle = playerAngle - 0.65f + (1.3f * x / (float)SCREEN_W);
+    float rayX = cosf(rayAngle);
+    float rayY = sinf(rayAngle);
+    float distance = 0.0f;
+
+    while (distance < 12.0f) {
+      distance += 0.04f;
+      if (wallAt(playerX + rayX * distance, playerY + rayY * distance)) break;
+    }
+
+    distance *= cosf(rayAngle - playerAngle);
+    if (distance < 0.1f) distance = 0.1f;
+
+    int wallHeight = constrain((int)(90.0f / distance), 1, 170);
+    int startY = 85 - wallHeight / 2;
+    uint16_t color = distance < 2.0f ? ORANGE :
+                     distance < 4.0f ? RED : GRAY;
+    tft.drawFastVLine(x, startY, wallHeight, color);
+  }
+
+  tft.setTextColor(WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(5, 5);
+  tft.print("GITES199 DOOM");
+  tft.setCursor(250, 5);
+  tft.print("B: MENU");
+}
+
+void doomGame() {
+  playerX = 2.5f;
+  playerY = 2.5f;
+  playerAngle = 0.0f;
+
+  while (true) {
+    unsigned long frameStart = millis();
+
+    if (newPress(BTN_B)) {
+      waitRelease(BTN_B);
+      return;
+    }
+
+    if (key(BTN_LEFT)) playerAngle -= 0.045f;
+    if (key(BTN_RIGHT)) playerAngle += 0.045f;
+
+    float nextX = playerX;
+    float nextY = playerY;
+    if (key(BTN_UP)) {
+      nextX += cosf(playerAngle) * 0.07f;
+      nextY += sinf(playerAngle) * 0.07f;
+    }
+    if (key(BTN_DOWN)) {
+      nextX -= cosf(playerAngle) * 0.07f;
+      nextY -= sinf(playerAngle) * 0.07f;
+    }
+    if (!wallAt(nextX, playerY)) playerX = nextX;
+    if (!wallAt(playerX, nextY)) playerY = nextY;
+
+    renderDoom();
+    unsigned long elapsed = millis() - frameStart;
+    int waitMs = frameDelay() - (int)elapsed;
+    if (waitMs > 0) delay(waitMs);
+  }
+}
+
+// ---------- SIMPLE PLATFORMER ----------
+int platformX = 15;
+int platformY = 100;
+int platformVelocity = 0;
+int coins = 0;
+
+void platformGame() {
+  platformX = 15;
+  platformY = 100;
+  platformVelocity = 0;
+  coins = 0;
+
+  while (true) {
+    unsigned long frameStart = millis();
+
+    if (newPress(BTN_B)) {
+      waitRelease(BTN_B);
+      return;
+    }
+
+    if (key(BTN_LEFT)) platformX -= 2;
+    if (key(BTN_RIGHT)) platformX += 2;
+    platformX = constrain(platformX, 0, 308);
+
+    if (newPress(BTN_A) && platformY >= 100) platformVelocity = -11;
+
+    platformVelocity++;
+    if (platformVelocity > 10) platformVelocity = 10;
+    platformY += platformVelocity;
+
+    if (platformY >= 220) {
+      platformY = 100;
+      platformVelocity = 0;
+    }
+
+    if (platformX > 195 && platformX < 225 && platformY > 65 && platformY < 105) {
+      coins++;
+      platformX = 10;
+    }
+
+    tft.fillScreen(0x5DDF);
+    tft.fillRect(0, 135, SCREEN_W, 35, GREEN);
+    tft.fillRect(75, 112, 45, 6, ORANGE);
+    tft.fillRect(190, 92, 45, 6, ORANGE);
+    tft.fillCircle(210, 72, 6, YELLOW);
+    tft.fillRect(platformX, platformY, 12, 20, RED);
+    tft.fillRect(platformX + 2, platformY + 3, 8, 5, WHITE);
+
+    tft.setTextColor(BLACK);
+    tft.setCursor(5, 5);
+    tft.print("COINS: ");
+    tft.print(coins);
+    tft.setCursor(265, 155);
+    tft.print("B: MENU");
+
+    unsigned long elapsed = millis() - frameStart;
+    int waitMs = frameDelay() - (int)elapsed;
+    if (waitMs > 0) delay(waitMs);
+  }
+}
+
+// ---------- SD FILE BROWSER ----------
+void showFiles() {
+  if (!sdReady) {
+    tft.fillScreen(BLACK);
+    tft.setTextColor(RED);
+    tft.setCursor(10, 100);
+    tft.print("SD NOT FOUND");
+    delay(1200);
+    return;
+  }
+
+  File root = SD.open("/");
+  if (!root) return;
+
+  tft.fillScreen(BLACK);
+  tft.setTextColor(YELLOW);
+  tft.setCursor(5, 5);
+  tft.print("SD FILES");
+
+  int line = 0;
+  File entry;
+  while ((entry = root.openNextFile())) {
+    if (line < 7) {
+      tft.setTextColor(entry.isDirectory() ? GREEN : WHITE);
+      tft.setCursor(5, 25 + line * 17);
+      tft.print(entry.name());
+      if (entry.isDirectory()) tft.print("/");
+    }
+    line++;
+    entry.close();
+  }
+  root.close();
+
+  tft.setTextColor(GREEN);
+  tft.setCursor(270, 155);
+  tft.print("B: BACK");
+  while (!newPress(BTN_B)) delay(10);
+  waitRelease(BTN_B);
+}
+
+// ---------- TXT READER: /BOOKS/BOOK.TXT ----------
+void readText() {
+  if (!sdReady) {
+    tft.fillScreen(BLACK);
+    tft.setTextColor(RED);
+    tft.setCursor(10, 100);
+    tft.print("SD NOT FOUND");
+    delay(1200);
+    return;
+  }
+
+  File file = SD.open("/BOOKS/BOOK.TXT", FILE_READ);
+  if (!file) {
+    tft.fillScreen(BLACK);
+    tft.setTextColor(RED);
+    tft.setCursor(10, 100);
+    tft.print("BOOK NOT FOUND");
+    delay(1200);
+    return;
+  }
+
+  const int linesPerPage = 7;
+  String lines[linesPerPage];
+
+  while (true) {
+    bool hasContent = false;
+
+    for (int i = 0; i < linesPerPage; i++) {
+      lines[i] = "";
+      while (file.available()) {
+        char c = (char)file.read();
+        if (c == '\n') break;
+        if (c != '\r' && lines[i].length() < 52) lines[i] += c;
+      }
+      if (lines[i].length() > 0) hasContent = true;
+      if (!file.available() && i == linesPerPage - 1) break;
+    }
+
+    if (!hasContent) break;
+
+    tft.fillScreen(BLACK);
+    tft.setTextColor(WHITE);
+    tft.setTextSize(1);
+    for (int i = 0; i < linesPerPage; i++) {
+      tft.setCursor(5, 8 + i * 17);
+      tft.print(lines[i]);
+    }
+
+    tft.setTextColor(GREEN);
+    tft.setCursor(5, 145);
+    tft.print("UP/DOWN: NEXT");
+    tft.setCursor(250, 145);
+    tft.print("B: EXIT");
+
+    bool nextPage = false;
+    while (!nextPage) {
+      if (newPress(BTN_B)) {
+        waitRelease(BTN_B);
+        file.close();
+        return;
+      }
+      if (newPress(BTN_UP) || newPress(BTN_DOWN)) {
+        waitRelease(key(BTN_UP) ? BTN_UP : BTN_DOWN);
+        nextPage = true;
+      }
+      delay(10);
+    }
+  }
+
+  file.close();
+  tft.setTextColor(YELLOW);
+  tft.setCursor(5, 145);
+  tft.print("END OF FILE");
+  delay(800);
+}
+
+// ---------- SETUP ----------
+void setup() {
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_LEFT, INPUT_PULLUP);
+  pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pinMode(BTN_A, INPUT_PULLUP);
+  pinMode(BTN_B, INPUT_PULLUP);
+
+  pinMode(TFT_BL, OUTPUT);
+  analogWrite(TFT_BL, 255);
+
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
+  
+  // Инициализация ST7789 для экрана 320x170 (стандартный метод без ошибок)
+  tft.init(SCREEN_H, SCREEN_W); 
+  tft.setRotation(1);           // Альбомная ориентация (320x170)
+
+  tft.fillScreen(BLACK);
+  setBrightness();
+
+  sdReady = SD.begin(SD_CS, SPI);
+  bootLogo();
+}
+
+// ---------- MAIN LOOP ----------
+void loop() {
+  mainMenu();
+}
